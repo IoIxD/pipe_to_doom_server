@@ -1,3 +1,4 @@
 Token = ""
 GuildID = 0
 ChannelID = 0
+CommandToPipe = ""

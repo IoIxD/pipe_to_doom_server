@@ -2,10 +2,15 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+
+	//"io"
 	"log"
 	"os"
+	"os/exec"
 	"os/signal"
 	"syscall"
 	"time"
@@ -19,17 +24,26 @@ import (
 var g 		*gateway.Gateway
 var client 	*api.Client
 var ctx 	context.Context
-var me 		discord.User
+var me 		*discord.User
 
-var messageBuffer string
+var offset int 	= 0
+
+var messageBuffer *bytes.Buffer = new(bytes.Buffer)
+
+var stdout io.ReadCloser
+var stdin io.WriteCloser
 
 var cfg struct {
 	Token	string
 	GuildID	discord.GuildID
 	ChannelID discord.ChannelID
+	CommandToPipe string
 }
 
-var messages chan string
+var messages chan []byte
+var started chan bool
+
+var err error
 
 func main() {
 	// Get the config file
@@ -42,12 +56,11 @@ func main() {
 
 	// Initialize the client
 	client = api.NewClient("Bot "+cfg.Token)
-	me_, err := client.Me() 
+	me, err = client.Me() 
 	if(err != nil) {
 		fmt.Println(err)
 		return
 	}
-	me = *me_
 
 	// Start listening for events.
 	ctx, _ = signal.NotifyContext(context.Background(), os.Interrupt)
@@ -56,17 +69,19 @@ func main() {
 		log.Fatalln("failed to initialize gateway:", err)
 	}
 
-	// set up a go routine for detecting when the program is closed.
-	watchForClose()
+	// set up a go routine for listing to stdin and sending shit to the program
+	go watchForStdin()
 
 	// set up a go routine for detecting when something is typed in the relevant channel
-	go watchForChannelMessages()
+	go watchForStdout()
+
+	// set up a go routine for detecting when the program is closed.
+	watchForClose()
 
 	// set up a go routine for watching the message buffer and posting it when it's not empty
 	go watchMessageBuffer()
 
-	// listen to the stdin
-	watchForStdin()
+	select {}
 }
 
 func watchForClose() {
@@ -74,49 +89,46 @@ func watchForClose() {
     signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGQUIT )
     go func() {
 	    <-sigs
-	    Print("Program stopped.")
+	    //Print("Program stopped.")
 	    os.Exit(0)
     }()
 }
 
-func watchForChannelMessages() {
+func watchForStdout() {
+	// for each event sent from the discord bot
 	for op := range g.Connect(ctx) {
 		switch data := op.Data.(type) {
-		case *gateway.ReadyEvent:
-			fmt.Println("Online.")
-		case *gateway.MessageCreateEvent:
-			if(data.ChannelID != cfg.ChannelID) {continue}
-			if(data.Author == me) {continue}
-			os.Stdout.Write([]byte(data.Content))
-			os.Stdout.Write([]byte("\n"))
-		}
-	}
-}
-
-func watchForStdin() {
-	// create a new stdin reader
-	reader := bufio.NewReader(os.Stdin)
-	// And start reading from it.
-	for {
-		message, _ := reader.ReadString('\n')
-		if(message == "") {
-			message = "­"
-		}
-		switch message {
-			// By default, just send the output to a channel.
-			default: 
-				messageBuffer += message
+			case *gateway.ReadyEvent: 			// when the bot is initialized
+				fmt.Println("Online.")
+				go runCommand()
+			case *gateway.MessageCreateEvent: 	// when a message is sent
+				// ignore anything not sent in the configured channel
+				if(data.ChannelID != cfg.ChannelID) {continue}
+				// or by the bot.
+				if(data.Author.Username == me.Username) {continue}
+				// basically send everything in the message to the terminal.
+				for _, v := range data.Content {
+					stdin.Write([]byte{byte(v)})
+				}
+				// and press enter.
+				stdin.Write([]byte{'\n'})
 		}
 	}
 }
 
 func watchMessageBuffer() {
 	for {
-		time.Sleep(time.Second * 1)
-		if(messageBuffer != "") {
-			fmt.Println(messageBuffer)
-			Print(messageBuffer)
-			messageBuffer = ""
+		// every 250 milliseconds...
+		time.Sleep(time.Millisecond * 250)
+		// get the section of bytes that we haven't read before.
+		newBuffer := messageBuffer.Bytes()[offset:]
+		if(len(newBuffer) > 0) {
+			// send the new text to the discord channel
+			Print(string(newBuffer))
+			// send it here as well
+			fmt.Println(string(newBuffer))
+			// update the offset for what we've read
+			offset = len(messageBuffer.Bytes())
 		}
 	}
 }
@@ -125,5 +137,34 @@ func Print(str string) {
 	_, err := client.SendMessage(cfg.ChannelID,str)
 	if(err != nil) {
 		fmt.Println(err)
+	}
+}
+
+func runCommand() {
+	cmd := exec.Command(cfg.CommandToPipe)
+
+	// errors are ignored because for these to fail is such a rare occurance
+	// and if they do fail you have bigger problems; you'll probably see the error
+	// long before you see this.
+	stdout, _ = cmd.StdoutPipe()
+	stdin, _ = cmd.StdinPipe()
+
+	if err := cmd.Start(); err != nil {
+		fmt.Println(err)
+		return
+	}
+
+	messageBuffer.ReadFrom(stdout)
+}
+
+func watchForStdin() {
+	// create a new stdin reader
+	reader := bufio.NewReader(os.Stdin)
+	// And start reading from it.
+	for {
+		message, _ := reader.ReadString('\n')
+		for _, v := range message {
+			stdin.Write([]byte{byte(v)})
+		}
 	}
 }
